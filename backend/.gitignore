@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+venv39/
+dist/
+build/
+ops-agent
+ops-agent-static
+*.zip
+pgvector/
+pgvector_index.html
+repodata.json
+debug_*.py
+find_*.py
+search_*.py
+list_*.py
+release/final_package/
+

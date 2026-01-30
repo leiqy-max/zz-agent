@@ -1,8 +1,9 @@
+import sys
 from fastapi import FastAPI, Request, UploadFile, File, Depends, HTTPException, status, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+# from fastapi.templating import Jinja2Templates # Removed
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import uuid
@@ -13,11 +14,21 @@ from rag.qa import answer_question
 from rag.loader import load_document, load_text_content
 from db import engine
 from sqlalchemy import text
-from typing import List
-from datetime import timedelta, datetime
+from typing import List, Optional, Dict, Union
+from datetime import timedelta, datetime, timezone
 import io
 import base64
+
+# Define China Timezone
+CN_TZ = timezone(timedelta(hours=8))
+
+def get_current_time_str():
+    return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+import base64
 from captcha.image import ImageCaptcha
+import uvicorn
+from config_loader import config
 
 import json
 
@@ -27,10 +38,21 @@ from auth import (
     get_current_active_user, get_password_hash, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_path, relative_path)
+
 # 初始化 FastAPI
 app = FastAPI()
 
 # Mount user images directory
+# Ensure user_images is in the working directory (persisted), not inside temp _MEIPASS
 if not os.path.exists("user_images"):
     os.makedirs("user_images")
 app.mount("/user_images", StaticFiles(directory="user_images"), name="user_images")
@@ -65,97 +87,115 @@ question_buffer = load_question_history()
 async def startup_event():
     try:
         with engine.connect() as conn:
-            # 启用 pgvector 扩展
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            # 创建 documents 表 (Zhipu embedding-2 维度为 1024)
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS documents (
-                    id SERIAL PRIMARY KEY,
-                    content TEXT,
-                    metadata JSONB,
-                    embedding vector(1024)
-                )
-            """))
-            # 创建 chat_logs 表 (用于记录完整问答和反馈)
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS chat_logs (
-                    id SERIAL PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer TEXT,
-                    feedback VARCHAR(20),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            # Add username column if not exists
+            # 1. Create Users Table (Critical for Auth)
             try:
-                conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS username VARCHAR(50)"))
-                conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS image_path VARCHAR(512)"))
-                conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'normal'"))
-                conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS sources JSONB"))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        username VARCHAR(50) UNIQUE NOT NULL,
+                        hashed_password VARCHAR(255) NOT NULL,
+                        role VARCHAR(20) NOT NULL
+                    )
+                """))
+                conn.commit()
+                print("✅ Users table initialized")
             except Exception as e:
-                print(f"Migration note: {e}")
+                print(f"❌ Failed to create users table: {e}")
 
-            # Create learned_qa table
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS learned_qa (
-                    id SERIAL PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            
-            # 创建 question_history 表 (保留旧表定义以免报错，后续可迁移)
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS question_history (
-                    id SERIAL PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
+            # 2. Create other independent tables
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS chat_logs (
+                        id SERIAL PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        answer TEXT,
+                        feedback VARCHAR(20),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                # Add username column if not exists
+                try:
+                    conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS username VARCHAR(50)"))
+                    conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS image_path VARCHAR(512)"))
+                    conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'normal'"))
+                    conn.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS sources JSONB"))
+                except Exception as e:
+                    print(f"Migration note: {e}")
 
-            # Create Users Table
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username VARCHAR(50) UNIQUE NOT NULL,
-                    hashed_password VARCHAR(255) NOT NULL,
-                    role VARCHAR(20) NOT NULL
-                )
-            """))
-
-            # Create Uploaded Files Table (for approval workflow)
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS uploaded_files (
-                    id SERIAL PRIMARY KEY,
-                    filename VARCHAR(255) NOT NULL,
-                    file_path VARCHAR(512) NOT NULL,
-                    uploader VARCHAR(50) NOT NULL,
-                    status VARCHAR(20) DEFAULT 'pending', -- pending, approved, rejected
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            conn.commit()
-            
-            # Seed Default Users
-            # Check if admin exists
-            result = conn.execute(text("SELECT username FROM users WHERE username = 'admin'")).fetchone()
-            if not result:
-                admin_pwd = get_password_hash("admin123")
-                conn.execute(text("INSERT INTO users (username, hashed_password, role) VALUES ('admin', :pwd, 'admin')"), {"pwd": admin_pwd})
-                print("Created default admin user")
-            
-            result = conn.execute(text("SELECT username FROM users WHERE username = 'user'")).fetchone()
-            if not result:
-                user_pwd = get_password_hash("user123")
-                conn.execute(text("INSERT INTO users (username, hashed_password, role) VALUES ('user', :pwd, 'user')"), {"pwd": user_pwd})
-                print("Created default normal user")
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS learned_qa (
+                        id SERIAL PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        answer TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
                 
-            conn.commit()
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS question_history (
+                        id SERIAL PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
 
-        print("✅ Database initialized successfully")
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS uploaded_files (
+                        id SERIAL PRIMARY KEY,
+                        filename VARCHAR(255) NOT NULL,
+                        file_path VARCHAR(512) NOT NULL,
+                        uploader VARCHAR(50) NOT NULL,
+                        status VARCHAR(20) DEFAULT 'pending', -- pending, approved, rejected
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                conn.commit()
+                print("✅ Core tables initialized")
+            except Exception as e:
+                print(f"❌ Failed to create core tables: {e}")
+
+            # 3. Enable pgvector and create documents table
+            try:
+                # 启用 pgvector 扩展
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit() # Commit extension creation
+                
+                # 创建 documents 表 (Zhipu embedding-2 维度为 1024)
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS documents (
+                        id SERIAL PRIMARY KEY,
+                        content TEXT,
+                        metadata JSONB,
+                        embedding vector(1024)
+                    )
+                """))
+                conn.commit()
+                print("✅ Vector extension and documents table initialized")
+            except Exception as e:
+                print(f"⚠️ Vector extension/documents table failed (RAG may not work): {e}")
+
+            # 4. Seed Default Users
+            try:
+                # Check if admin exists
+                result = conn.execute(text("SELECT username FROM users WHERE username = 'admin'")).fetchone()
+                if not result:
+                    admin_pwd = get_password_hash("admin123")
+                    conn.execute(text("INSERT INTO users (username, hashed_password, role) VALUES ('admin', :pwd, 'admin')"), {"pwd": admin_pwd})
+                    print("Created default admin user")
+                
+                result = conn.execute(text("SELECT username FROM users WHERE username = 'user'")).fetchone()
+                if not result:
+                    user_pwd = get_password_hash("user123")
+                    conn.execute(text("INSERT INTO users (username, hashed_password, role) VALUES ('user', :pwd, 'user')"), {"pwd": user_pwd})
+                    print("Created default normal user")
+                    
+                conn.commit()
+            except Exception as e:
+                print(f"⚠️ Failed to seed users: {e}")
+
+        print("✅ Database initialization sequence completed")
     except Exception as e:
-        print(f"⚠️ Database initialization failed: {e}")
+        print(f"⚠️ Database initialization critical error: {e}")
 
 # 允许跨域请求
 app.add_middleware(
@@ -166,22 +206,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 使用 Jinja2 模板
-templates = Jinja2Templates(directory="templates")
+# 使用 Jinja2 模板 - REMOVED
+# templates = Jinja2Templates(directory="templates")
 
 # 创建一个 Pydantic 模型来接收请求的 body
 class QuestionRequest(BaseModel):
     question: str
-    image: str | None = None
+    image: Union[str, None] = None
+    session_id: Union[str, None] = None
 
 class FeedbackRequest(BaseModel):
     question_id: int
     status: str  # 'solved' or 'unsolved'
+    session_id: Union[str, None] = None
+    rating: Union[int, None] = None
+    comment: Union[str, None] = None
 
-# 显示前端页面
-@app.get("/", response_class=HTMLResponse)
-async def get_index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+# Static Files Serving (Moved to end of file to avoid blocking API routes)
+# See bottom of file
 
 @app.get("/captcha")
 def get_captcha():
@@ -339,7 +381,7 @@ def upload_document(
                     "filename": file.filename,
                     "type": "user_upload",
                     "uploader": current_user.username,
-                    "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "upload_time": get_current_time_str()
                 }
                 
                 # 调用 loader 进行入库，传入 kb_type
@@ -544,7 +586,7 @@ def reprocess_docs(force: bool = False):
     for file_path in files_to_process:
         try:
              filename = os.path.basename(file_path)
-             upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+             upload_time = get_current_time_str()
              metadata = {
                  "source": file_path,
                  "filename": filename,
@@ -732,7 +774,7 @@ def add_qa(req: ManualQARequest, current_user: User = Depends(get_current_active
             "type": "learned_qa",
             "question": question,
             "added_by": current_user.username,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "created_at": get_current_time_str()
         }
         content = f"问题：{question}\n答案：{answer}"
         
@@ -824,6 +866,29 @@ def get_answer(req: QuestionRequest, current_user: User = Depends(get_current_ac
         if isinstance(rag_result, dict):
             answer = rag_result.get("answer")
             sources = rag_result.get("sources", [])
+            
+            # Source Filtering Heuristic:
+            # If the answer explicitly cites documents (contains filenames),
+            # filter the sources list to only include those mentioned.
+            # This addresses user feedback about "attachments mismatch".
+            if sources and answer:
+                cited_sources = []
+                has_citation = False
+                for src in sources:
+                    filename = src.get("filename", "")
+                    # Robust check:
+                    # 1. Exact match
+                    # 2. Match without extension (e.g. "Manual" in answer, filename is "Manual.pdf")
+                    if filename:
+                        base_name = os.path.splitext(filename)[0]
+                        if (filename in answer) or (base_name in answer):
+                            cited_sources.append(src)
+                            has_citation = True
+                
+                # If at least one source is cited, use the filtered list.
+                # Otherwise, keep all (fallback, maybe LLM didn't follow citation format).
+                if has_citation:
+                    sources = cited_sources
         else:
             answer = rag_result
             sources = []
@@ -891,3 +956,32 @@ def debug_db_status():
             return info
     except Exception as e:
         return {"error": str(e)}
+
+# Static Files Serving (Moved to end of file to avoid blocking API routes)
+static_dir = resource_path("static")
+if os.path.exists(static_dir):
+    # Mount assets
+    assets_dir = os.path.join(static_dir, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+    
+    # Catch-all for SPA
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Prevent path traversal
+        normalized_path = os.path.normpath(full_path)
+        if normalized_path.startswith(".."):
+             raise HTTPException(status_code=404)
+             
+        file_path = os.path.join(static_dir, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        
+        # Return index.html for unknown paths (SPA routing)
+        return FileResponse(os.path.join(static_dir, "index.html"))
+
+if __name__ == "__main__":
+    server_config = config.server
+    port = int(server_config.get("port") or os.getenv("PORT", 9020))
+    print(f"Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
